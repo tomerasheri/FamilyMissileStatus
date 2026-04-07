@@ -20,6 +20,7 @@
  */
 
 const { v4: uuid }    = require('uuid');
+const crypto           = require('crypto');
 const db               = require('./db');
 const wa               = require('./whatsapp');
 const { reverseGeocode } = require('./geocoder');
@@ -198,6 +199,9 @@ async function handleText({ waId, name, text }) {
   if (lower === '/status' || lower === 'status') {
     return cmdStatus(waId);
   }
+  if (lower === '/delete' || lower === 'delete') {
+    return cmdDelete(waId);
+  }
   if (lower === '/help' || lower === 'help' || lower === 'hi' || lower === 'hello' || lower === 'שלום') {
     return cmdHelp(waId, name);
   }
@@ -214,6 +218,9 @@ async function handleText({ waId, name, text }) {
   }
 }
 
+const MAX_GROUPS_PER_USER = 5;
+const MAX_MEMBERS_PER_GROUP = 20;
+
 // /create <group name>
 async function cmdCreate(waId, name, text) {
   const raw = text.replace(/^\/?create\s+/i, '');
@@ -226,6 +233,11 @@ async function cmdCreate(waId, name, text) {
   const user = db.getUser(waId);
   if (!user) {
     return wa.sendText(waId, '⚠️ Please share your location first to register.');
+  }
+
+  // Limit how many groups a single user can create to prevent message-amplification attacks
+  if (db.countGroupsCreatedBy(waId) >= MAX_GROUPS_PER_USER) {
+    return wa.sendText(waId, `⚠️ You can create at most ${MAX_GROUPS_PER_USER} groups.`);
   }
 
   const groupId    = uuid();
@@ -265,6 +277,11 @@ async function cmdJoin(waId, name, text) {
     return wa.sendText(waId, `ℹ️ You're already a member of *${group.name}*.`);
   }
 
+  // Cap group size to limit alert fan-out
+  if (db.countGroupMembers(group.id) >= MAX_MEMBERS_PER_GROUP) {
+    return wa.sendText(waId, `⚠️ This group is full (max ${MAX_MEMBERS_PER_GROUP} members).`);
+  }
+
   db.addMember(group.id, waId);
 
   const members = db.getMembers(group.id);
@@ -276,16 +293,17 @@ async function cmdJoin(waId, name, text) {
     `Members: ${members.map(m => m.phone || m.wa_id).join(', ')}`,
   );
 
-  // Notify existing members
+  // Notify existing members — sanitize name before broadcasting to others
+  const safeName = sanitizeName(name);
   for (const m of members) {
     if (m.wa_id === waId) continue;
-    wa.sendText(m.wa_id, `👋 *${name}* joined the group *${group.name}*!`).catch(() => {});
+    wa.sendText(m.wa_id, `👋 *${safeName}* joined the group *${group.name}*!`).catch(() => {});
   }
 }
 
 // /leave [code]  — if no code, leave all groups
 async function cmdLeave(waId, name, text) {
-  const code = text.replace(/^\/?leave\s*/i, '').trim().toUpperCase();
+  const code = text.replace(/^\/?leave\s*/i, '').trim().toUpperCase().replace(/[^A-Z0-9]/g, '');
 
   if (code) {
     const group = db.getGroupByCode(code);
@@ -300,8 +318,9 @@ async function cmdLeave(waId, name, text) {
     await wa.sendText(waId, `✅ Left *${group.name}*.`);
 
     const remaining = db.getMembers(group.id);
+    const safeName  = sanitizeName(name);
     for (const m of remaining) {
-      wa.sendText(m.wa_id, `ℹ️ ${name} left *${group.name}*.`).catch(() => {});
+      wa.sendText(m.wa_id, `ℹ️ ${safeName} left *${group.name}*.`).catch(() => {});
     }
   } else {
     const groups = db.getUserGroups(waId);
@@ -348,6 +367,23 @@ async function cmdStatus(waId) {
   await wa.sendText(waId, lines.join('\n').trim());
 }
 
+// /delete — erase all personal data for this user
+async function cmdDelete(waId) {
+  const user = db.getUser(waId);
+  if (!user) {
+    return wa.sendText(waId, `ℹ️ You're not registered, so there's nothing to delete.`);
+  }
+
+  db.deleteUser(waId);
+
+  await wa.sendText(
+    waId,
+    `🗑️ *All your data has been deleted.*\n\n` +
+    `Your location, group memberships, and alert history have been removed.\n\n` +
+    `You will no longer receive alerts. Share your location again to re-register.`,
+  );
+}
+
 // /help
 async function cmdHelp(waId, name) {
   await wa.sendText(
@@ -359,7 +395,8 @@ async function cmdHelp(waId, name) {
     `*/create* _Name_ – Create a new family group\n` +
     `*/join* _CODE_ – Join a group using an invite code\n` +
     `*/leave* _CODE_ – Leave a specific group\n` +
-    `*/status* – See the current safety status of all your group members\n\n` +
+    `*/status* – See the current safety status of all your group members\n` +
+    `*/delete* – Permanently erase all your data from this bot\n\n` +
     `*How it works*\n` +
     `When a rocket alert fires in your city, you'll receive a message with two buttons: ✅ Safe or 🆘 Help.\n` +
     `If you don't respond within 10 minutes, we'll send a reminder and notify your family group.`,
@@ -369,12 +406,27 @@ async function cmdHelp(waId, name) {
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 function generateCode() {
-  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // no O,0,I,1
-  let code = '';
-  for (let i = 0; i < 6; i++) {
-    code += chars[Math.floor(Math.random() * chars.length)];
-  }
-  return code;
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // no O,0,I,1 to avoid visual confusion
+  // Use crypto.randomBytes for cryptographically secure randomness.
+  // Math.random() is predictable and must never be used for security-sensitive tokens.
+  const bytes = crypto.randomBytes(6);
+  return Array.from(bytes, (b) => chars[b % chars.length]).join('');
+}
+
+/**
+ * Sanitise a WhatsApp display name before embedding it in messages sent to
+ * other users. The name comes from the webhook payload and is fully controlled
+ * by the sender, so it must be treated as untrusted input.
+ *  - Strips WhatsApp markdown formatting characters (* _ ~ ` > [ ])
+ *    to prevent spoofed bold/italic text in messages to others.
+ *  - Truncates to 50 characters.
+ */
+function sanitizeName(raw) {
+  if (!raw || typeof raw !== 'string') return 'Unknown';
+  return raw
+    .replace(/[*_~`>\[\]]/g, '')  // strip WhatsApp markdown
+    .trim()
+    .slice(0, 50) || 'Unknown';
 }
 
 module.exports = { handle };

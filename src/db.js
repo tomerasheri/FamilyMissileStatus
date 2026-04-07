@@ -149,6 +149,30 @@ const _markSeen  = db.prepare(`
 `);
 const _isSeen    = db.prepare('SELECT 1 FROM seen_alerts WHERE alert_id = ?');
 
+// ── Limits ────────────────────────────────────────────────────────────────────
+
+const _countGroupsCreatedBy = db.prepare(`
+  SELECT COUNT(*) AS n FROM family_groups WHERE created_by = ?
+`);
+const _countGroupMembers = db.prepare(`
+  SELECT COUNT(*) AS n FROM group_members WHERE group_id = ?
+`);
+
+// ── Data deletion (right to erasure) ─────────────────────────────────────────
+
+// Wrapped in a transaction so it's all-or-nothing
+const _deleteUser = db.transaction((waId) => {
+  db.prepare('DELETE FROM group_members    WHERE wa_id = ?').run(waId);
+  db.prepare('DELETE FROM pending_responses WHERE wa_id = ?').run(waId);
+  db.prepare('DELETE FROM users            WHERE wa_id = ?').run(waId);
+  // Clean up groups the user created that now have no members
+  db.prepare(`
+    DELETE FROM family_groups
+    WHERE created_by = ?
+      AND id NOT IN (SELECT group_id FROM group_members)
+  `).run(waId);
+});
+
 // ── Public API ────────────────────────────────────────────────────────────────
 
 module.exports = {
@@ -176,4 +200,8 @@ module.exports = {
 
   markAlertSeen: (alertId, cities) => _markSeen.run(alertId, cities),
   isAlertSeen:   (alertId) => !!_isSeen.get(alertId),
+
+  countGroupsCreatedBy: (waId) => _countGroupsCreatedBy.get(waId).n,
+  countGroupMembers:    (groupId) => _countGroupMembers.get(groupId).n,
+  deleteUser:           (waId) => _deleteUser(waId),
 };
