@@ -61,7 +61,8 @@ async function notifyGroupOfSilence(row) {
   const groups = db.getUserGroups(row.wa_id);
   if (groups.length === 0) return;
 
-  const name = user?.phone || row.wa_id;
+  // Show only last-4 digits – never broadcast a full phone number cross-user
+  const shortId = `…${row.wa_id.slice(-4)}`;
 
   for (const group of groups) {
     const members = db.getMembers(group.id);
@@ -70,9 +71,10 @@ async function notifyGroupOfSilence(row) {
       if (member.wa_id === row.wa_id) continue;
 
       const text =
-        `⚠️ *${group.name}* – No response\n\n` +
-        `${name} was alerted about *${row.city}* 10 minutes ago and has not responded.\n\n` +
-        `Please check on them if possible.`;
+        `⚠️ *${group.name}* – אין תגובה | No response\n\n` +
+        `${shortId} קיבל/ה התראה על *${row.city}* לפני 10 דקות ולא ענה/תה.\n` +
+        `${shortId} was alerted about *${row.city}* 10 min ago and has not responded.\n\n` +
+        `אנא בדוק/י אם ניתן. | Please check on them if possible.`;
 
       wa.sendText(member.wa_id, text).catch(() => {});
     }

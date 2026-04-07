@@ -118,7 +118,8 @@ async function notifyGroupMembers(alertedUser, city, alertTitle, alertId) {
   const groups = db.getUserGroups(alertedUser.wa_id);
   if (groups.length === 0) return;
 
-  const name = alertedUser.phone || alertedUser.wa_id;
+  // Show only last-4 of wa_id to avoid broadcasting full phone numbers
+  const shortId = `…${alertedUser.wa_id.slice(-4)}`;
 
   for (const group of groups) {
     const members = db.getMembers(group.id);
@@ -127,10 +128,11 @@ async function notifyGroupMembers(alertedUser, city, alertTitle, alertId) {
       if (member.wa_id === alertedUser.wa_id) continue;
 
       const text =
-        `👨‍👩‍👧 *${group.name}* – Group Alert\n\n` +
-        `⚠️ ${alertTitle} in *${city}*\n` +
-        `Waiting for ${name} to confirm they're safe.\n\n` +
-        `You'll get an update once they respond.`;
+        `👨‍👩‍👧 *${group.name}* – התראה | Alert\n\n` +
+        `⚠️ ${alertTitle} ב-*${city}*\n` +
+        `ממתים לאישור מ-${shortId}.\n` +
+        `Waiting for ${shortId} to confirm they're safe.\n\n` +
+        `תעודכן/י ברגע שיענו. | You'll be updated once they respond.`;
 
       wa.sendText(member.wa_id, text).catch(() => {});
     }

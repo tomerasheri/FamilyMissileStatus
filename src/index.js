@@ -8,6 +8,7 @@ const nudgeScheduler = require('./nudgeScheduler');
 const wa             = require('./whatsapp');
 const msgHandler     = require('./messageHandler');
 const security       = require('./security');
+const db             = require('./db');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
@@ -107,6 +108,11 @@ app.listen(PORT, () => {
 
   alertPoller.start();
   nudgeScheduler.start();
+
+  // Enforce 30-day data retention policy on startup, then daily.
+  // Satisfies PPL proportionality and Amendment 13 retention obligations.
+  db.purgeExpiredData();
+  setInterval(() => db.purgeExpiredData(), 24 * 60 * 60 * 1000).unref();
 });
 
 // Graceful shutdown
