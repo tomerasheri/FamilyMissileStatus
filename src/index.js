@@ -2,22 +2,28 @@
 
 require('dotenv').config();
 
-const express       = require('express');
-const alertPoller   = require('./alertPoller');
+const express        = require('express');
+const alertPoller    = require('./alertPoller');
 const nudgeScheduler = require('./nudgeScheduler');
-const wa            = require('./whatsapp');
-const msgHandler    = require('./messageHandler');
+const wa             = require('./whatsapp');
+const msgHandler     = require('./messageHandler');
+const security       = require('./security');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
 
 // ── Middleware ────────────────────────────────────────────────────────────────
 
-app.use(express.json());
+// Capture the raw body buffer so we can verify Meta's HMAC-SHA256 signature.
+// Must come before any body-parsing middleware.
+app.use(
+  express.json({
+    verify: (req, _res, buf) => { req.rawBody = buf; },
+  }),
+);
 
 // ── Webhook verification (GET) ────────────────────────────────────────────────
-// Meta calls this URL with a challenge when you configure the webhook in the
-// Developer Portal. Respond with hub.challenge to verify ownership.
+// Meta calls this with hub.challenge when you first configure the webhook.
 
 app.get('/webhook', (req, res) => {
   const mode      = req.query['hub.mode'];
@@ -35,27 +41,41 @@ app.get('/webhook', (req, res) => {
 
 // ── Incoming messages (POST) ──────────────────────────────────────────────────
 
-app.post('/webhook', async (req, res) => {
-  // Acknowledge immediately – Meta requires a 200 within 5 s
-  res.sendStatus(200);
+app.post(
+  '/webhook',
+  security.verifyWebhookSignature,   // ← reject forged requests first
+  async (req, res) => {
+    // Acknowledge immediately – Meta requires a 200 within 5 s.
+    res.sendStatus(200);
 
-  const body = req.body;
+    const body = req.body;
+    if (body.object !== 'whatsapp_business_account') return;
 
-  // Ignore status updates (delivered, read receipts, etc.)
-  if (body.object !== 'whatsapp_business_account') return;
+    const parsed = wa.parseWebhookEntry(body);
+    if (!parsed) return;
 
-  const parsed = wa.parseWebhookEntry(body);
-  if (!parsed) return;
+    // Validate sender ID format before touching the DB or sending replies
+    if (!security.validateWaId(parsed.waId)) {
+      console.warn(`[Webhook] Suspicious wa_id rejected: ${parsed.waId}`);
+      return;
+    }
 
-  // Mark as read (fire-and-forget)
-  if (parsed.msgId) wa.markRead(parsed.msgId);
+    // Rate limit: drop if this sender is sending too fast
+    if (!security.checkRateLimit(parsed.waId)) {
+      console.warn(`[Webhook] Rate limit hit for ${parsed.waId}`);
+      return;
+    }
 
-  try {
-    await msgHandler.handle(parsed);
-  } catch (err) {
-    console.error('[Webhook] Handler error:', err);
-  }
-});
+    // Mark as read (fire-and-forget)
+    if (parsed.msgId) wa.markRead(parsed.msgId);
+
+    try {
+      await msgHandler.handle(parsed);
+    } catch (err) {
+      console.error('[Webhook] Handler error:', err);
+    }
+  },
+);
 
 // ── Health check ──────────────────────────────────────────────────────────────
 
@@ -70,6 +90,7 @@ function checkEnv() {
     'WHATSAPP_PHONE_NUMBER_ID',
     'WHATSAPP_TOKEN',
     'WHATSAPP_VERIFY_TOKEN',
+    'WHATSAPP_APP_SECRET',
   ];
   const missing = required.filter((k) => !process.env[k]);
   if (missing.length) {
@@ -89,13 +110,5 @@ app.listen(PORT, () => {
 });
 
 // Graceful shutdown
-process.on('SIGTERM', () => {
-  alertPoller.stop();
-  nudgeScheduler.stop();
-  process.exit(0);
-});
-process.on('SIGINT', () => {
-  alertPoller.stop();
-  nudgeScheduler.stop();
-  process.exit(0);
-});
+process.on('SIGTERM', () => { alertPoller.stop(); nudgeScheduler.stop(); process.exit(0); });
+process.on('SIGINT',  () => { alertPoller.stop(); nudgeScheduler.stop(); process.exit(0); });

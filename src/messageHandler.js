@@ -23,6 +23,11 @@ const { v4: uuid }    = require('uuid');
 const db               = require('./db');
 const wa               = require('./whatsapp');
 const { reverseGeocode } = require('./geocoder');
+const {
+  validateGroupName,
+  validateCoordinates,
+  validateUuid,
+} = require('./security');
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
@@ -39,6 +44,11 @@ async function handle(parsed) {
 // ── Location ──────────────────────────────────────────────────────────────────
 
 async function handleLocation({ waId, name, lat, lon }) {
+  if (!validateCoordinates(lat, lon)) {
+    console.warn(`[MsgHandler] Invalid coordinates from ${waId}: ${lat},${lon}`);
+    return;
+  }
+
   let geo = { cityHe: null, cityEn: null, display: `${lat},${lon}` };
   try {
     geo = await reverseGeocode(lat, lon);
@@ -76,6 +86,20 @@ async function handleButtonReply({ waId, name, buttonId }) {
 
   if (!pendingId || (action !== 'safe_yes' && action !== 'safe_no')) {
     return; // unknown button
+  }
+
+  // Validate UUID format to guard against injection / path traversal via buttonId
+  if (!validateUuid(pendingId)) {
+    console.warn(`[MsgHandler] Malformed pendingId in button reply from ${waId}`);
+    return;
+  }
+
+  // Ownership check: only the user the alert was sent to may respond to it
+  const pending = db.getOpenPending(waId);
+  if (!pending || pending.id !== pendingId) {
+    console.warn(`[MsgHandler] Button reply ownership mismatch from ${waId} for ${pendingId}`);
+    // Don't reveal whether the pending ID exists to the sender
+    return;
   }
 
   const response = action === 'safe_yes' ? 'safe' : 'unsafe';
@@ -192,10 +216,12 @@ async function handleText({ waId, name, text }) {
 
 // /create <group name>
 async function cmdCreate(waId, name, text) {
-  const groupName = text.replace(/^\/?create\s+/i, '').trim();
-  if (!groupName) {
-    return wa.sendText(waId, 'Usage: */create* _Family Group Name_');
+  const raw = text.replace(/^\/?create\s+/i, '');
+  const validation = validateGroupName(raw);
+  if (!validation.ok) {
+    return wa.sendText(waId, `⚠️ ${validation.reason}\n\nUsage: */create* _Family Group Name_`);
   }
+  const groupName = validation.value;
 
   const user = db.getUser(waId);
   if (!user) {
@@ -219,9 +245,10 @@ async function cmdCreate(waId, name, text) {
 
 // /join <code>
 async function cmdJoin(waId, name, text) {
-  const code = text.replace(/^\/?join\s+/i, '').trim().toUpperCase();
-  if (!code) {
-    return wa.sendText(waId, 'Usage: */join* _INVITE_CODE_');
+  // Strip everything except alphanumeric chars so someone can't probe the DB
+  const code = text.replace(/^\/?join\s+/i, '').trim().toUpperCase().replace(/[^A-Z0-9]/g, '');
+  if (!code || code.length !== 6) {
+    return wa.sendText(waId, 'Usage: */join* _INVITE_CODE_ (6-character code)');
   }
 
   const user = db.getUser(waId);
